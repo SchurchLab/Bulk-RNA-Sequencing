@@ -1,0 +1,312 @@
+---
+title: "RNAseq"
+author: "Lanzhu/Jing"
+date: "2025-03-04"
+output: html_document
+---
+
+```{r show out, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, include = TRUE)
+```
+
+### 1. setup for RNAseq
+
+```{r Install necessary packages}
+
+# Install BiocManager if not already installed
+if (!requireNamespace("BiocManager", quietly = TRUE)) {
+  install.packages("BiocManager")
+}
+
+# Use BiocManager to install Bioconductor packages
+BiocManager::install("AnnotationDbi", force = TRUE)
+BiocManager::install("biomaRt")
+BiocManager::install("fgsea")
+
+# Install CRAN packages
+install.packages("stringr")
+install.packages("DESeq2")
+install.packages("ggplot2")
+install.packages("pheatmap")
+```
+
+
+```{r Load and clean raw count data}
+
+#read the raw_counts.txt file obtained from upstream analyses
+# Set file paths
+input_file <- "path_to_your_data/CML_MK_counts.txt"  # Path to the raw counts file
+output_file_csv <- "path_to_save/CML_MK_filtered_count.csv"  # Path to save the filtered counts
+output_file_txt <- "path_to_save/CML_MK_filtered_count.txt"  # Path to save the filtered counts
+
+# Read the raw counts data
+data <- read.table(input_file, header = TRUE, skip = 1)
+
+# Clean column names
+# Remove specific prefixes or unwanted strings
+colnames(data) <- gsub("path_to_your_data_prefix", "", colnames(data), fixed = TRUE)
+# Rename a specific sample column if necessary
+colnames(data)[39] <- "bpCML_10"
+
+# Extract gene expression data (assuming gene names are in the first column, expression data starts from the seventh column)
+countdata <- data[, -1]  # Exclude the first column (gene names)
+rownames(countdata) <- data[, 1]  # Set the first column as row names
+
+# Filter genes: retain genes expressed in at least 40% of samples
+expression_threshold <- 0.4
+countdata <- countdata[rowSums(countdata > 0) >= floor(expression_threshold * ncol(countdata)), ]
+
+# Save the filtered count data to CSV/txt file
+write.csv(countdata, output_file_csv, row.names = TRUE)
+write.table(countdata, output_file_txt, sep = "\t", row.names = TRUE, col.names = TRUE)
+```
+
+
+
+```{r Data processing}
+#This script processes the raw gene expression data, filters, annotates with gene symbols, and removes duplicates
+# Load required library
+library(biomaRt)
+
+# Set file paths for input and output files
+input_file <- "path_to_your_data/CML_MK_filtered_count.txt"
+
+output_file_csv <- "path_to_your_data/CML_MK_filtered_count_cleaned.csv"
+output_file_txt <- "path_to_your_data/CML_MK_filtered_count_cleaned.txt"
+
+# Step 1: Read clenaed raw count data
+data <- read.table(input_file, header = TRUE)
+
+# Step 2: Clean Gene IDs by removing numbers after ENSG ID dot
+data$Geneid <- sub("\\..*", "", data$Geneid)
+
+# Step 3: Set up biomaRt to fetch gene symbols and IDs
+ensembl <- useEnsembl(biomart = "genes", dataset = "hsapiens_gene_ensembl")
+
+# Step 4: Extract ENSG IDs for annotation
+ensg_ids <- data[, 1]
+
+# Step 5: Fetch gene annotations (Gene Symbols and Gene IDs)
+annotations <- getBM(attributes = c('ensembl_gene_id', 'hgnc_symbol', 'entrezgene_id'),
+                     filters = 'ensembl_gene_id', values = ensg_ids, mart = ensembl)
+
+# Step 6: Merge annotations with the original data
+counts_data_annotated <- merge(data, annotations, by.x = 'Geneid', by.y = 'ensembl_gene_id', all.x = TRUE, sort = FALSE)
+
+# Step 7: Reorganize columns: move GeneSymbol and GeneID to the second and third columns
+counts_data_annotated <- counts_data_annotated[, c(1, ncol(counts_data_annotated)-1, ncol(counts_data_annotated), 2:(ncol(counts_data_annotated)-2))]
+
+# Step 8: Rename columns to 'GeneSymbol' and 'GeneID'
+names(counts_data_annotated)[2] <- "GeneSymbol"
+names(counts_data_annotated)[3] <- "GeneID"
+
+# Step 9: Remove unwanted columns and keep GeneSymbol
+counts_data_annotated <- counts_data_annotated[, -c(1, 3)]
+
+# Step 10: Remove rows with missing or empty GeneSymbols
+counts_data_annotated_filtered <- counts_data_annotated[counts_data_annotated$GeneSymbol != "", ]
+
+
+# Step 11: Remove duplicate GeneSymbols and ensure unique GeneSymbol
+unique_data <- counts_data_annotated_filtered[!duplicated(counts_data_annotated_filtered$GeneSymbol), ]
+
+# Step 12: Remove rows with missing values in the first column (GeneSymbol)
+missing_values <- any(is.na(unique_data[, 1]))
+if (missing_values) {
+  unique_data <- unique_data[complete.cases(unique_data[, 1]), ]
+}
+
+# Step 13: Set the GeneSymbol as the row names
+row.names(unique_data) <- unique_data[, 1]
+
+# Step 14: Remove the GeneSymbol column as it is now the row name
+unique_data <- unique_data[, -1, drop = FALSE]
+
+# Step 15: Save the final cleaned data as CSV and TXT
+write.csv(unique_data, output_file_csv, quote = FALSE, row.names = TRUE)
+write.table(unique_data, output_file_txt, sep = "\t", quote = FALSE, row.names = TRUE)
+
+```
+
+
+
+### 2. Differential expression gene analysis
+```{r create metadata file for DESeq2}
+
+#create metadata file
+metadata_HBM_cpCML_apCML_bpCML <- data.frame(sample_id = colnames(data2))
+Group <- rep(c("HBM", "cpCML", "apCML", "bpCML"), times = c(17, 16, 4, 10))
+metadata_HBM_CML_apCML_bpCML$Group <- factor(Group, levels = c("HBM", "cpCML", "apCML", "bpCML"))
+
+# set the number in first column as row name
+row.names(metadata_HBM_cpCML_apCML_bpCML) <- metadata_HBM_cpCML_apCML_bpCML[, 1]
+
+# delte first column
+metadata_HBM_cpCML_apCML_bpCML <- metadata_HBM_cpCML_apCML_bpCML[, -1, drop = FALSE]
+
+# save
+write.table(metadata_HBM_cpCML_apCML_bpCML, file = "path_to_your_data/metadata_HBM_cpCML_apCML_bpCML.txt", sep = "\t", quote = FALSE, row.names = TRUE)
+
+```
+
+
+
+```{r DESeq2 matrix construction}
+
+library(DESeq2)
+
+#create DESeqDataSet target
+dds <- DESeqDataSetFromMatrix(countData = unique_data, colData = metadata_HBM_cpCML_apCML_bpCML, design = ~Group)
+
+#normalize
+dds <- DESeq(dds)
+dds
+```
+
+
+
+```{r Principle component analysis (PCA)}
+
+# Load necessary library
+library(ggplot2)
+
+#rlog standardization，Take a look at the PCA and Significant Difference Gene heatmap of the samples through the normalization matrix to normalize the count overall
+
+dds_vsd <- varianceStabilizingTransformation(dds, blind=FALSE)
+
+PCA_plot <- plotPCA(dds_vsd, intgroup="Group", ntop=500) +
+  theme_bw() + 
+  geom_point(size = 0.25) + # dot size
+  #scale_y_continuous(limits=c(-20, 30)) +
+  ggtitle(label="HBM_cpCML_apCML_bpCML(PCA)",
+          subtitle="Top 500 most variable genes")
+
+```
+
+
+```{r differential gene expression analysis}
+
+# Compare 'CML' group to 'HBM' group
+CML_HBM_DEG <- results(dds,
+                  contrast = c("Group", "CML", "HBM"), # Define comparison groups
+                  pAdjustMethod = "fdr",               # Adjust p-values using FDR
+                  alpha = 0.05)                        # Significance level
+
+# Convert results to a data frame and order by adjusted p-value
+CML_HBM_DEG <- as.data.frame(CML_HBM_DEG[order(CML_HBM_DEG$padj), ])
+
+# Remove rows with NA values
+CML_HBM_DEG <- na.omit(CML_HBM_DEG)
+
+# Define thresholds for log2 fold change and adjusted p-value
+fc_cutoff <- 1
+fdr_cutoff <- 0.05
+
+# Classify genes based on log2 fold change and adjusted p-value
+CML_HBM_DEG$regulated <- "normal"
+CML_HBM_DEG$regulated[CML_HBM_DEG$log2FoldChange > fc_cutoff & CML_HBM_DEG$padj < fdr_cutoff] <- "up"
+CML_HBM_DEG$regulated[CML_HBM_DEG$log2FoldChange < -fc_cutoff & CML_HBM_DEG$padj < fdr_cutoff] <- "down"
+
+# Display the number of genes in each category
+table(CML_HBM_DEG$regulated)
+
+write.csv(CML_HBM_DEG, file = "path_to_your_data/CML_HBM_DEG.csv", quote = FALSE, row.names = TRUE)
+```
+
+
+
+
+```{r volcano plot}
+# Load necessary library
+library(ggplot2)
+library(ggrepel)
+library(dplyr)
+library(tibble)
+
+# Convert row names to a 'gene' column
+CML_HBM_DEG <- CML_HBM_DEG %>% rownames_to_column(var = "gene")
+
+# Set threshold values
+fc_cutoff <- 1  # Log2 fold change cutoff
+fdr <- 0.05     # Adjusted p-value cutoff
+
+# Create volcano plot
+CMLvsHBM_volcano_plot <- ggplot(CML_HBM_DEG, aes(x = log2FoldChange, y = -log10(padj), color = regulated)) +
+  geom_point(alpha = 0.6, size = 2) +
+  scale_color_manual(values = c("blue", "black", "red"), 
+                     labels = c("Down", "Normal", "Up")) +
+  theme_minimal() +
+  geom_vline(xintercept = c(-fc_cutoff, fc_cutoff), lty = 4, col = "black", lwd = 0.8) +
+  geom_hline(yintercept = -log10(fdr), lty = 4, col = "black", lwd = 0.8) +
+  labs(title = "DEG Volcano Plot (CML vs HBM)", 
+       x = "Log2 Fold Change", 
+       y = "-Log10 Adjusted P-value") +
+  theme(legend.position = "right") +
+  theme(panel.border = element_rect(colour = "black", fill = NA, size = 1)) 
+
+
+# Identify top upregulated genes
+top_up_genes <- CML_HBM_DEG %>% 
+  filter(log2FoldChange > 0) %>%      
+  arrange(desc(log2FoldChange)) %>%      
+  head(20)                          
+
+top_down_genes <- CML_HBM_DEG %>% 
+  filter(log2FoldChange < 0) %>%        
+  arrange(log2FoldChange) %>%           
+  head(20)                            
+
+# Combine top upregulated and downregulated genes
+labeldata <- rbind(top_up_genes, top_down_genes)
+
+# Add gene labels to the plot
+CMLvsHBM_volcano_plot <- CMLvsHBM_volcano_plot + 
+  geom_text_repel(data = labeldata, 
+                  aes(label = rownames(labeldata)), 
+                  size = 3, 
+                  box.padding = 0.5, 
+                  point.padding = 0.5,
+                  max.overlaps = Inf) # 
+
+# Display the plot
+print(CMLvsHBM_volcano_plot)
+```
+
+
+
+```{r pathway analysis}
+
+#  To perform enrichment analysis using the DAVID database (https://david.ncifcrf.gov/summary.jsp) for the downregulated genes from your CML_HBM_DEG dataset and then visualize the results using a bubble plot in ggplot2, you can follow these steps:
+
+# 设置工作目录并读取数据
+
+DAVID_pathways <- read.csv("path_to_your_data/DAVID_pathways.csv", sep = ";", stringsAsFactors = FALSE) # this csv file exported from DAVID website
+
+# Filter for KEGG pathways
+DAVID_pathways_selected <- subset(DAVID_pathways, Category == "KEGG_PATHWAY") 
+DAVID_pathways_selected <- DAVID_pathways_selected[1:10, ]
+
+# 创建 ggplot 对象
+KEGG_pathway_plot <- ggplot(DAVID_pathways_selected, aes(Fold_Enrichment, Term)) +
+  geom_point() + 
+  geom_point(aes(size = Count)) +  
+  geom_point(aes(size = Count, color = -1 * log10(PValue))) +  
+  scale_color_gradient(low = "green", high = "red") +  
+  labs(color = expression(-log[10](PValue)),  
+       size = "Count", 
+       x = "Fold Enrichment", 
+       y = "Pathway name", 
+       title = "Pathway enrichment") +  
+  theme_bw()  
+
+# Display the plot
+print(KEGG_pathway_plot)
+
+# Save the plot as a PDF file
+ggsave(
+  filename = "KEGG_Pathway_Enrichment_Plot.pdf",
+  plot = KEGG_pathway_plot,
+  path = "path_to_your_data"
+)
+```
+
